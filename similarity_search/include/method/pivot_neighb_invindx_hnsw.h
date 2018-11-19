@@ -95,6 +95,9 @@ class PivotNeighbInvertedIndexHNSW : public Index<dist_t> {
     kStoreSort
   } inv_proc_alg_;
 
+  vector<unique_ptr<vector<PostingListInt>>> tmp_posting_lists_;
+  vector<size_t>                             tmp_post_doc_qty_;
+
   vector<unique_ptr<PostingListInt>> posting_lists_;
   vector<unique_ptr<mutex>>          post_list_mutexes_;
 
@@ -122,6 +125,29 @@ class PivotNeighbInvertedIndexHNSW : public Index<dist_t> {
   mutable size_t  proc_query_qty_store_sort_ = 0;
 
   mutable mutex   stat_mutex_;
+
+  void flushTmpPost(unsigned threadId) {
+    CHECK(threadId <= tmp_posting_lists_.size());
+
+    tmp_post_doc_qty_[threadId] = 0;
+    vector<PostingListInt>& tmpAllPivList = (*tmp_posting_lists_[threadId]);
+
+    for (IdType pivId = 0; pivId < num_pivot_; ++pivId) {
+      {
+        unique_lock <mutex> lock(*post_list_mutexes_[pivId]);
+
+        PostingListInt& permList = *posting_lists_[pivId];
+        PostingListInt& tmpList = tmpAllPivList[pivId];
+
+        size_t oldSize = permList.size();
+        size_t addSize = tmpList.size();
+        permList.resize(oldSize + addSize);
+        memcpy(&permList[oldSize], &tmpList[0], sizeof(tmpList[0]) * addSize);
+        // Don't forget to clear the temporary buffer!
+        tmpList.clear();
+      }
+    }
+  }
 
 };
 

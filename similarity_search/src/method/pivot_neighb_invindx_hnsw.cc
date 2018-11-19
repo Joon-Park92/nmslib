@@ -45,6 +45,8 @@
 
 namespace similarity {
 
+const size_t MAX_TMP_DOC_QTY = 4096;
+
 using std::vector;
 using std::pair;
 using std::mutex;
@@ -168,31 +170,53 @@ void PivotNeighbInvertedIndexHNSW<dist_t>::CreateIndex(const AnyParams& IndexPar
   hnswParamsSearch.AddChangeParam("ef", efPivotSearchIndex_);
   pivot_index_->SetQueryTimeParams(hnswParamsSearch);
 
+  tmp_posting_lists_.resize(index_thread_qty_);
+  tmp_post_doc_qty_.resize(index_thread_qty_);
+
+  for (unsigned i = 0; i < index_thread_qty_; ++i) {
+    tmp_posting_lists_[i].reset(new vector<PostingListInt>(num_pivot_));
+    CHECK(tmp_posting_lists_[i]->size() == num_pivot_);
+  }
+
   // The search for close pivots can be run in parallel,
     // but modification of the inverted files doesn't have to be (b/c it's super fast)
-  ParallelFor(0, this->data_.size(), index_thread_qty_, [&](unsigned id, unsigned threadId) {
+  ParallelFor(0, this->data_.size(), index_thread_qty_, [&](unsigned docId, unsigned threadId) {
     vector<IdType> pivotIds;
-    const Object* pObj = this->data_[id];
+    const Object* pObj = this->data_[docId];
 
     GetClosePivotIds(pObj, num_prefix_, pivotIds);
 
-    // We need to sort pivotIds or else we may get a deadlock!
-    boost::sort::spreadsort::integer_sort(pivotIds.begin(), pivotIds.end());
-
     for (IdType pivId: pivotIds) {
       CHECK(pivId < num_pivot_);
-      {
-        unique_lock<mutex> lock(*post_list_mutexes_[pivId]);
-        posting_lists_[pivId]->push_back(id);
-      }
+      (*tmp_posting_lists_[threadId])[pivId].push_back(docId);
     }
 
-    if (id % 1000 && PrintProgress_) {
+    if (++tmp_post_doc_qty_[threadId] >= MAX_TMP_DOC_QTY) {
+      flushTmpPost(threadId);
+    }
+
+    if (docId % 1000 && PrintProgress_) {
       unique_lock<mutex> lock(progress_bar_mutex_);
       if (progress_bar_)
         ++(*progress_bar_);
     }
   });
+
+  for (unsigned threadId=0; threadId < index_thread_qty_; ++threadId) {
+    flushTmpPost(threadId);
+  }
+
+  /*
+   * Actually sorting doesn't have a substantial effect in the case of kStoreSort and
+   * the postings are gonna be approximately sorted anyways.
+   */
+
+  #if 0
+  ParallelFor(0, num_pivot_, index_thread_qty_, [&](unsigned pivId, unsigned threadId) {
+    PostingListInt& permList = *posting_lists_[pivId];
+    boost::sort::spreadsort::integer_sort(permList.begin(), permList.end());
+  });
+#endif
 
   tmp_res_pool_.reset(new VectorPool<IdType>(index_thread_qty_, expCandQtyUB_));
   counter_pool_.reset(new VectorPool<unsigned>(index_thread_qty_, this->data_.size()));
@@ -393,7 +417,7 @@ void PivotNeighbInvertedIndexHNSW<dist_t>::GenSearch(QueryType* query, size_t K)
     CHECK(counter && counter->size() >= this->data_.size());
     CHECK(num_prefix_search_ >= 1);
     counterBeg = &(*counter)[0];
-    
+
     for (IdTypeUnsign pivId : pivotIds) {
       const PostingListInt &post = *(posting_lists_[pivId]);
 
